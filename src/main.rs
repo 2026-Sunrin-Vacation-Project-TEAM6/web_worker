@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod message;
 mod redis_stream;
@@ -24,9 +25,31 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use config::Config;
-use redis_stream::{connect, ensure_consumer_group, publish_message, room_stream_key, run_consumer};
+use message::ClientMessage;
+use redis_stream::{
+    connect, ensure_consumer_group, fetch_presence_snapshot, publish_message, room_stream_key,
+    run_consumer,
+};
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "StackBox web_worker",
+        version = "0.1.0",
+        description = "Realtime collaboration relay: WebSocket room broadcast, presence, and doc-update persistence for a stack box."
+    ),
+    paths(health, ws_handler),
+    components(schemas(ClientMessage)),
+    tags(
+        (name = "system", description = "Service health"),
+        (name = "realtime", description = "WebSocket relay for a stack box's collaboration room")
+    )
+)]
+struct ApiDoc;
 
 struct Room {
     tx: broadcast::Sender<String>,
@@ -40,11 +63,13 @@ struct AppState {
     consumer_group: String,
     consumer_name: String,
     rooms: Mutex<HashMap<i64, Room>>,
+    jwt_secret: String,
+    jwt_algorithm: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct WsParams {
-    user_id: Option<i64>,
+    token: String,
 }
 
 #[tokio::main]
@@ -68,12 +93,15 @@ async fn main() {
         consumer_group: config.consumer_group.clone(),
         consumer_name: config.consumer_name.clone(),
         rooms: Mutex::new(HashMap::new()),
+        jwt_secret: config.jwt_secret.clone(),
+        jwt_algorithm: config.jwt_algorithm.clone(),
     });
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws/{stack_box_id}", get(ws_handler))
-        .with_state(state);
+        .with_state(state)
+        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()));
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -88,17 +116,51 @@ async fn main() {
     axum::serve(listener, app).await.expect("server failed");
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "system",
+    responses(
+        (status = 200, description = "Service is healthy", body = String)
+    )
+)]
 async fn health() -> impl IntoResponse {
     "ok"
 }
 
+#[utoipa::path(
+    get,
+    path = "/ws/{stack_box_id}",
+    tag = "realtime",
+    params(
+        ("stack_box_id" = i64, Path, description = "ID of the stack box (collaboration room) to join"),
+        ("token" = String, Query, description = "JWT access token; its `sub` claim must be a valid user id with access to this stack box")
+    ),
+    responses(
+        (status = 101, description = "Switching Protocols — connection upgraded to a WebSocket. Once open, clients exchange JSON messages shaped like `ClientMessage` (doc_update, presence, code_result)."),
+        (status = 401, description = "Missing or invalid JWT"),
+        (status = 403, description = "Authenticated user cannot access this stack box")
+    )
+)]
 async fn ws_handler(
     Path(stack_box_id): Path<i64>,
     Query(params): Query<WsParams>,
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, stack_box_id, params.user_id))
+    let user_id = match auth::verify_token(&params.token, &state.jwt_secret, &state.jwt_algorithm) {
+        Some(user_id) => user_id,
+        None => {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+
+    if !auth::can_access_stack_box(&state.db, stack_box_id, user_id).await {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, stack_box_id, user_id))
+        .into_response()
 }
 
 /// Returns the room's broadcast sender, lazily creating the room (and its
@@ -174,7 +236,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
     stack_box_id: i64,
-    user_id: Option<i64>,
+    user_id: i64,
 ) {
     info!("websocket client connected to room {}", stack_box_id);
 
@@ -182,6 +244,22 @@ async fn handle_socket(
     let mut stream_rx = tx.subscribe();
     let stream_key = room_stream_key(&state.stream_prefix, stack_box_id);
     let mut interval = tokio::time::interval(Duration::from_secs(30));
+
+    match fetch_presence_snapshot(&state.db, stack_box_id, user_id).await {
+        Ok(snapshot) => {
+            for presence_message in snapshot {
+                if socket.send(Message::Text(presence_message.into())).await.is_err() {
+                    drop(stream_rx);
+                    cleanup_room_if_empty(&state, stack_box_id).await;
+                    return;
+                }
+            }
+        }
+        Err(err) => warn!(
+            "failed to load presence snapshot for room {}: {}",
+            stack_box_id, err
+        ),
+    }
 
     loop {
         tokio::select! {
@@ -191,7 +269,7 @@ async fn handle_socket(
                         match message::parse_client_message(&text) {
                             Ok(_) => {
                                 let mut redis = state.redis.clone();
-                                match publish_message(&mut redis, &stream_key, &text, user_id).await {
+                                match publish_message(&mut redis, &stream_key, &text, Some(user_id)).await {
                                     Ok(entry_id) => info!("published to stream: {}", entry_id),
                                     Err(err) => error!("failed to publish to stream: {}", err),
                                 }
