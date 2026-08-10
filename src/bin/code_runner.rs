@@ -4,10 +4,11 @@
 //! it is a reasonable boundary for trusted/internal use only.
 use std::net::SocketAddr;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::Json;
-use axum::http::StatusCode;
+use axum::extract::{Json, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
@@ -19,6 +20,15 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const CPU_TIME_LIMIT_SECS: u64 = 5;
 const MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+const NPROC_LIMIT: u64 = 32;
+const NOFILE_LIMIT: u64 = 64;
+const FSIZE_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+const AUTH_HEADER: &str = "x-code-runner-token";
+
+#[derive(Clone)]
+struct AppState {
+    auth_token: Arc<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecuteRequest {
@@ -40,15 +50,26 @@ struct ExecuteResponse {
 async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let host = std::env::var("CODE_RUNNER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let host = std::env::var("CODE_RUNNER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("CODE_RUNNER_PORT")
         .unwrap_or_else(|_| "3001".to_string())
         .parse()
         .expect("CODE_RUNNER_PORT must be a valid port number");
+    let auth_token = std::env::var("CODE_RUNNER_AUTH_TOKEN").unwrap_or_default();
+    if auth_token.is_empty() {
+        panic!(
+            "CODE_RUNNER_AUTH_TOKEN must be set to a non-empty shared secret \
+             before code_runner can accept requests to /execute"
+        );
+    }
+    let state = AppState {
+        auth_token: Arc::new(auth_token),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/execute", post(execute));
+        .route("/execute", post(execute))
+        .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("invalid bind address");
     tracing::info!("code_runner listening on {}", addr);
@@ -65,7 +86,23 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn execute(Json(req): Json<ExecuteRequest>) -> impl IntoResponse {
+async fn execute(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ExecuteRequest>,
+) -> impl IntoResponse {
+    let provided = headers
+        .get(AUTH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !constant_time_eq(provided.as_bytes(), state.auth_token.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+
     match run_sandboxed(req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(err) => (
@@ -74,6 +111,13 @@ async fn execute(Json(req): Json<ExecuteRequest>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn interpreter_for(language: &str) -> Result<(&'static str, Vec<&'static str>), String> {
@@ -94,12 +138,16 @@ async fn run_sandboxed(req: ExecuteRequest) -> Result<ExecuteResponse, String> {
 
     let mut command = Command::new(program);
     command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
         .args(&base_args)
         .arg(&req.code)
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
 
     unsafe {
@@ -118,6 +166,7 @@ async fn run_sandboxed(req: ExecuteRequest) -> Result<ExecuteResponse, String> {
             return Err(format!("failed to spawn interpreter: {e}"));
         }
     };
+    let pid = child.id();
 
     if let Some(stdin_data) = req.stdin.as_deref() {
         if let Some(mut stdin) = child.stdin.take() {
@@ -128,6 +177,16 @@ async fn run_sandboxed(req: ExecuteRequest) -> Result<ExecuteResponse, String> {
     }
 
     let awaited = tokio::time::timeout(WALL_CLOCK_TIMEOUT, child.wait_with_output()).await;
+    if awaited.is_err() {
+        // Timed out: the interpreter is its own process-group leader (see
+        // `process_group(0)` above), so kill the whole group — not just the
+        // leader — to catch any subprocesses it spawned before we give up.
+        if let Some(pid) = pid {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
     let _ = tokio::fs::remove_dir_all(&dir).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -143,11 +202,15 @@ async fn run_sandboxed(req: ExecuteRequest) -> Result<ExecuteResponse, String> {
     }
 }
 
-/// Applies CPU-time and address-space limits to the child process. Runs
-/// after fork(), before exec() — must stay async-signal-safe.
+/// Applies CPU-time, memory, process-count, open-file, and output-size
+/// limits to the child process. Runs after fork(), before exec() — must
+/// stay async-signal-safe.
 fn apply_rlimits() {
     let _ = rlimit::setrlimit(rlimit::Resource::CPU, CPU_TIME_LIMIT_SECS, CPU_TIME_LIMIT_SECS);
     let _ = rlimit::setrlimit(rlimit::Resource::AS, MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES);
+    let _ = rlimit::setrlimit(rlimit::Resource::NPROC, NPROC_LIMIT, NPROC_LIMIT);
+    let _ = rlimit::setrlimit(rlimit::Resource::NOFILE, NOFILE_LIMIT, NOFILE_LIMIT);
+    let _ = rlimit::setrlimit(rlimit::Resource::FSIZE, FSIZE_LIMIT_BYTES, FSIZE_LIMIT_BYTES);
 }
 
 fn truncate_utf8(bytes: &[u8], max_bytes: usize) -> String {

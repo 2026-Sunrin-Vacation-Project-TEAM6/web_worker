@@ -2469,6 +2469,7 @@ dependencies = [
  "base64",
  "futures-util",
  "jsonwebtoken",
+ "libc",
  "redis",
  "rlimit",
  "serde",
