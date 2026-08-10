@@ -3,6 +3,7 @@ use std::time::Duration;
 use base64::Engine;
 use redis::aio::ConnectionManager;
 use redis::RedisResult;
+use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
@@ -91,25 +92,34 @@ pub async fn run_consumer(
                     for (entry_id, message, sender_user_id) in messages {
                         info!("stream message {}: {}", entry_id, message);
 
-                        if let Ok(client_message) = message::parse_client_message(&message) {
-                            if let Err(err) = persist_message(
-                                &db,
-                                stack_box_id,
-                                client_message,
-                                sender_user_id,
-                                &mut next_seq,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "failed to persist message in room {}: {}",
-                                    stack_box_id, err
+                        let outbound_message = match message::parse_client_message(&message) {
+                            Ok(client_message) => {
+                                let stamped = message::stamp_presence_sender(
+                                    &message,
+                                    client_message.clone(),
+                                    sender_user_id,
                                 );
+                                if let Err(err) = persist_message(
+                                    &db,
+                                    stack_box_id,
+                                    client_message,
+                                    sender_user_id,
+                                    &mut next_seq,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "failed to persist message in room {}: {}",
+                                        stack_box_id, err
+                                    );
+                                }
+                                stamped
                             }
-                        }
+                            Err(_) => message.clone(),
+                        };
 
                         if outbound.receiver_count() > 0 {
-                            let _ = outbound.send(message);
+                            let _ = outbound.send(outbound_message);
                         }
 
                         if let Err(err) = redis::cmd("XACK")
@@ -161,12 +171,15 @@ async fn persist_message(
             Ok(())
         }
         ClientMessage::Presence {
-            user_id,
             cursor_x,
             cursor_y,
             selection,
             color,
+            ..
         } => {
+            let Some(user_id) = sender_user_id else {
+                return Ok(());
+            };
             sqlx::query(
                 "INSERT INTO canvas_presence (stack_box_id, user_id, cursor_x, cursor_y, selection, color, last_seen_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
@@ -184,7 +197,45 @@ async fn persist_message(
             .await?;
             Ok(())
         }
+        ClientMessage::CodeResult { .. } => {
+            // Already persisted as a CodeRun row by the backend before
+            // publishing; nothing to do here beyond the broadcast above.
+            Ok(())
+        }
     }
+}
+
+/// Loads the other collaborators' last known cursor positions in a room, so
+/// a client that just joined sees them right away instead of waiting for
+/// each peer's next mouse move. Stale rows (no update in 5 minutes) are
+/// excluded since their sender has likely disconnected.
+pub async fn fetch_presence_snapshot(
+    db: &PgPool,
+    stack_box_id: i64,
+    joining_user_id: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(i64, Option<f64>, Option<f64>, Option<Value>, Option<String>)> = sqlx::query_as(
+        "SELECT user_id, cursor_x, cursor_y, selection, color FROM canvas_presence \
+         WHERE stack_box_id = $1 AND user_id != $2 AND last_seen_at > NOW() - INTERVAL '5 minutes'",
+    )
+    .bind(stack_box_id)
+    .bind(joining_user_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(user_id, cursor_x, cursor_y, selection, color)| {
+            serde_json::to_string(&ClientMessage::Presence {
+                cursor_x,
+                cursor_y,
+                selection,
+                color,
+                user_id: Some(user_id),
+            })
+            .ok()
+        })
+        .collect())
 }
 
 fn parse_stream_messages(value: &redis::Value) -> Option<Vec<(String, String, Option<i64>)>> {
