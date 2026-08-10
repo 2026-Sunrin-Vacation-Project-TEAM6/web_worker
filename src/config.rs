@@ -6,6 +6,8 @@ pub struct Config {
     pub stream_prefix: String,
     pub consumer_group: String,
     pub consumer_name: String,
+    pub jwt_secret: String,
+    pub jwt_algorithm: String,
 }
 
 impl Config {
@@ -27,6 +29,8 @@ impl Config {
                 .unwrap_or_else(|_| "web_worker".to_string()),
             consumer_name: std::env::var("REDIS_STREAM_CONSUMER")
                 .unwrap_or_else(|_| "worker-1".to_string()),
+            jwt_secret: std::env::var("JWT_SECRET").unwrap_or_else(|_| "change-me".to_string()),
+            jwt_algorithm: std::env::var("JWT_ALGORITHM").unwrap_or_else(|_| "HS256".to_string()),
         }
     }
 }
