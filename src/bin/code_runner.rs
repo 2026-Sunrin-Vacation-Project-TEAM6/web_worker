@@ -20,7 +20,14 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const CPU_TIME_LIMIT_SECS: u64 = 5;
 const MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
-const NPROC_LIMIT: u64 = 32;
+// RLIMIT_NPROC is enforced per real UID for the whole container, not just the
+// spawned child: this service's own Tokio runtime alone already holds ~18
+// threads under the `app` user before any code even runs. Node.js needs
+// several more threads at startup (libuv threadpool + V8 platform threads),
+// so 32 left no headroom and made every JS run crash with
+// `uv_thread_create` assertion failures. Sized well above steady-state usage
+// while still bounding a fork bomb.
+const NPROC_LIMIT: u64 = 160;
 const NOFILE_LIMIT: u64 = 64;
 const FSIZE_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 const AUTH_HEADER: &str = "x-code-runner-token";
@@ -150,9 +157,10 @@ async fn run_sandboxed(req: ExecuteRequest) -> Result<ExecuteResponse, String> {
         .process_group(0)
         .kill_on_drop(true);
 
+    let is_node = program == "node";
     unsafe {
-        command.pre_exec(|| {
-            apply_rlimits();
+        command.pre_exec(move || {
+            apply_rlimits(is_node);
             Ok(())
         });
     }
@@ -205,9 +213,20 @@ async fn run_sandboxed(req: ExecuteRequest) -> Result<ExecuteResponse, String> {
 /// Applies CPU-time, memory, process-count, open-file, and output-size
 /// limits to the child process. Runs after fork(), before exec() — must
 /// stay async-signal-safe.
-fn apply_rlimits() {
+///
+/// The `AS` (virtual address space) limit is skipped for Node: V8 reserves a
+/// large virtual region up front (the pointer-compression cage / JIT code
+/// range, several GB) regardless of how much memory the script actually
+/// touches, so any tight `RLIMIT_AS` makes V8 itself fail to start with
+/// "Failed to reserve virtual memory for CodeRange" before user code ever
+/// runs. Python has no equivalent up-front reservation, so it keeps the real
+/// limit. The other limits (CPU time, wall-clock timeout, process count,
+/// open files, output size) still bound a runaway Node script.
+fn apply_rlimits(is_node: bool) {
     let _ = rlimit::setrlimit(rlimit::Resource::CPU, CPU_TIME_LIMIT_SECS, CPU_TIME_LIMIT_SECS);
-    let _ = rlimit::setrlimit(rlimit::Resource::AS, MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES);
+    if !is_node {
+        let _ = rlimit::setrlimit(rlimit::Resource::AS, MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES);
+    }
     let _ = rlimit::setrlimit(rlimit::Resource::NPROC, NPROC_LIMIT, NPROC_LIMIT);
     let _ = rlimit::setrlimit(rlimit::Resource::NOFILE, NOFILE_LIMIT, NOFILE_LIMIT);
     let _ = rlimit::setrlimit(rlimit::Resource::FSIZE, FSIZE_LIMIT_BYTES, FSIZE_LIMIT_BYTES);
