@@ -39,7 +39,7 @@ CMD ["web_worker"]
 FROM debian:bookworm-slim AS code_runner_runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates python3 nodejs \
+    && apt-get install -y --no-install-recommends ca-certificates python3 nodejs gcc g++ rustc \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r app && useradd -r -g app app
 
