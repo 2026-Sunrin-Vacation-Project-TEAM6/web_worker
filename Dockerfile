@@ -52,3 +52,11 @@ COPY --from=builder /app/target/release/code_runner /usr/local/bin/code_runner
 
 USER app
 CMD ["code_runner"]
+
+# TODO: add a runtime stage for the new `ppt_builder` binary. Unlike
+# code_runner and web_worker, this service needs network egress (it calls
+# the OpenAI API), so it cannot reuse the isolated/no-egress network
+# guidance above — it needs its own stage with a runtime capable of
+# outbound HTTPS (ca-certificates is already present in this pattern; just
+# make sure the container/network policy for this stage allows egress to
+# OPENAI_BASE_URL). Left out of this change intentionally; separate task.
