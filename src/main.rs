@@ -72,6 +72,9 @@ struct WsParams {
     token: String,
 }
 
+const MAX_WS_FRAME_BYTES: usize = 256 * 1024;
+const MAX_WS_MESSAGE_BYTES: usize = 512 * 1024;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
@@ -159,7 +162,13 @@ async fn ws_handler(
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, stack_box_id, user_id))
+    // Bound incoming frames so one client can't push a multi-MB blob (a Yjs
+    // update or presence payload) into Redis and every peer's memory at once.
+    // The default tungstenite cap is 64 MiB per message — far above what any
+    // legitimate edit is, and exactly what an abusive client would send.
+    ws.max_frame_size(MAX_WS_FRAME_BYTES)
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, stack_box_id, user_id))
         .into_response()
 }
 
@@ -266,6 +275,10 @@ async fn handle_socket(
             incoming = socket.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
+                        if text.len() > MAX_WS_MESSAGE_BYTES {
+                            warn!("dropping oversized message in room {}", stack_box_id);
+                            continue;
+                        }
                         match message::parse_client_message(&text) {
                             Ok(_) => {
                                 let mut redis = state.redis.clone();
