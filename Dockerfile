@@ -52,3 +52,23 @@ COPY --from=builder /app/target/release/code_runner /usr/local/bin/code_runner
 
 USER app
 CMD ["code_runner"]
+
+# ppt_builder runtime stage: unlike code_runner/web_worker, this service
+# needs network egress (it calls the OpenAI API) — do NOT run it with
+# --network=none or on an isolated no-egress network like code_runner.
+FROM debian:bookworm-slim AS ppt_builder_runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r app && useradd -r -g app app
+
+ENV PPT_BUILDER_HOST=0.0.0.0
+ENV PPT_BUILDER_PORT=3002
+
+EXPOSE 3002
+
+COPY --from=builder /app/target/release/ppt_builder /usr/local/bin/ppt_builder
+
+USER app
+CMD ["ppt_builder"]
