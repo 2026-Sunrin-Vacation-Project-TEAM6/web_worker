@@ -21,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_STDIN_BYTES: usize = 64 * 1024;
 const WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const CPU_TIME_LIMIT_SECS: u64 = 5;
 const CACHE_TTL_SECS: u64 = 3600;
@@ -437,6 +438,10 @@ async fn run_interpreted(
     let pid = child.id();
 
     if let Some(stdin_data) = req.stdin.as_deref() {
+        if stdin_data.len() > MAX_STDIN_BYTES {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            return Err(format!("stdin exceeds the {MAX_STDIN_BYTES}-byte limit"));
+        }
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(stdin_data.as_bytes()).await;
         }
