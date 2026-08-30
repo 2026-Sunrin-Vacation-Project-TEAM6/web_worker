@@ -28,6 +28,8 @@ pub enum ClientMessage {
         block_id: i64,
         stdout: String,
         stderr: String,
+        #[serde(default)]
+        compile_error: Option<String>,
         exit_code: i32,
         duration_ms: u64,
     },

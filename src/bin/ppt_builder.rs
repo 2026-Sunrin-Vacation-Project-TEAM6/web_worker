@@ -20,6 +20,7 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_SLIDES: u32 = 1;
 const MAX_SLIDES: u32 = 30;
+const MAX_PROMPT_CHARS: usize = 4_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -227,6 +228,11 @@ async fn build_presentation(state: &AppState, req: PptRequest) -> Result<Vec<u8>
 fn validate_request(req: &PptRequest) -> Result<(), BuildError> {
     if req.prompt.trim().is_empty() {
         return Err(BuildError::InvalidRequest("prompt must not be empty".to_string()));
+    }
+    if req.prompt.chars().count() > MAX_PROMPT_CHARS {
+        return Err(BuildError::InvalidRequest(format!(
+            "prompt exceeds the {MAX_PROMPT_CHARS}-character limit"
+        )));
     }
     if !(MIN_SLIDES..=MAX_SLIDES).contains(&req.num_slides) {
         return Err(BuildError::InvalidRequest(format!(
@@ -451,6 +457,18 @@ mod tests {
         };
         assert!(validate_request(&too_few).is_err());
         assert!(validate_request(&too_many).is_err());
+    }
+
+    #[test]
+    fn rejects_prompt_over_length_limit() {
+        let req = PptRequest {
+            prompt: "x".repeat(MAX_PROMPT_CHARS + 1),
+            num_slides: 5,
+        };
+        assert!(matches!(
+            validate_request(&req),
+            Err(BuildError::InvalidRequest(_))
+        ));
     }
 
     #[test]
