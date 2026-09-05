@@ -6,7 +6,7 @@ use redis::RedisResult;
 use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::message::{self, ClientMessage};
 
@@ -71,6 +71,11 @@ pub async fn run_consumer(
     stack_box_id: i64,
     mut next_seq: i64,
 ) {
+    // Tracks consecutive XREADGROUP failures so a sustained Redis outage backs
+    // off instead of retrying once a second indefinitely.
+    let mut consecutive_errors: u32 = 0;
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
     loop {
         let response: RedisResult<redis::Value> = redis::cmd("XREADGROUP")
             .arg("GROUP")
@@ -88,9 +93,10 @@ pub async fn run_consumer(
 
         match response {
             Ok(value) => {
+                consecutive_errors = 0;
                 if let Some(messages) = parse_stream_messages(&value) {
                     for (entry_id, message, sender_user_id) in messages {
-                        info!("stream message {}: {}", entry_id, message);
+                        debug!("stream message {}: {}", entry_id, message);
 
                         let outbound_message = match message::parse_client_message(&message) {
                             Ok(client_message) => {
@@ -135,8 +141,15 @@ pub async fn run_consumer(
                 }
             }
             Err(err) => {
-                error!("stream read failed: {}", err);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                let backoff = Duration::from_secs(1)
+                    .saturating_mul(1 << consecutive_errors.min(5))
+                    .min(MAX_BACKOFF);
+                error!(
+                    "stream read failed (attempt {}): {}; retrying in {:?}",
+                    consecutive_errors, err, backoff
+                );
+                tokio::time::sleep(backoff).await;
             }
         }
     }

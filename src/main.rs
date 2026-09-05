@@ -24,7 +24,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -172,15 +172,27 @@ async fn ws_handler(
         .into_response()
 }
 
-/// Returns the room's broadcast sender, lazily creating the room (and its
-/// backing Redis consumer group + consumer task) on first connection.
-async fn get_or_create_room(state: &Arc<AppState>, stack_box_id: i64) -> broadcast::Sender<String> {
+/// Returns the room's broadcast sender plus a receiver already subscribed to
+/// it, lazily creating the room (and its backing Redis consumer group +
+/// consumer task) on first connection.
+///
+/// The receiver MUST be created here, before the `rooms` lock is released:
+/// `cleanup_room_if_empty` treats `receiver_count() == 0` as "safe to tear
+/// down", guarded by the same lock. If a caller subscribed only after this
+/// function returned, a concurrent disconnect on the last other client could
+/// win that race and abort the consumer task between this room being handed
+/// back and the new client subscribing, silently orphaning the connection.
+async fn get_or_create_room(
+    state: &Arc<AppState>,
+    stack_box_id: i64,
+) -> (broadcast::Sender<String>, broadcast::Receiver<String>) {
     let mut rooms = state.rooms.lock().await;
     if let Some(room) = rooms.get(&stack_box_id) {
-        return room.tx.clone();
+        let rx = room.tx.subscribe();
+        return (room.tx.clone(), rx);
     }
 
-    let (tx, _rx) = broadcast::channel(256);
+    let (tx, rx) = broadcast::channel(256);
     let stream_key = room_stream_key(&state.stream_prefix, stack_box_id);
     let mut conn = state.redis.clone();
 
@@ -224,7 +236,7 @@ async fn get_or_create_room(state: &Arc<AppState>, stack_box_id: i64) -> broadca
     );
 
     info!("room {} opened", stack_box_id);
-    tx
+    (tx, rx)
 }
 
 /// Tears down a room's consumer task once its last client has disconnected,
@@ -249,8 +261,7 @@ async fn handle_socket(
 ) {
     info!("websocket client connected to room {}", stack_box_id);
 
-    let tx = get_or_create_room(&state, stack_box_id).await;
-    let mut stream_rx = tx.subscribe();
+    let (_tx, mut stream_rx) = get_or_create_room(&state, stack_box_id).await;
     let stream_key = room_stream_key(&state.stream_prefix, stack_box_id);
     let mut interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -283,7 +294,7 @@ async fn handle_socket(
                             Ok(_) => {
                                 let mut redis = state.redis.clone();
                                 match publish_message(&mut redis, &stream_key, &text, Some(user_id)).await {
-                                    Ok(entry_id) => info!("published to stream: {}", entry_id),
+                                    Ok(entry_id) => debug!("published to stream: {}", entry_id),
                                     Err(err) => error!("failed to publish to stream: {}", err),
                                 }
                             }
@@ -309,7 +320,11 @@ async fn handle_socket(
                 }
             }
             _ = interval.tick() => {
-                if socket.send(Message::Text("ping".into())).await.is_err() {
+                // A protocol-level ping needs no app-side handling: the
+                // browser answers it automatically and it never reaches
+                // `onmessage`, unlike the bare "ping" text frame this used
+                // to send (which the frontend had to special-case).
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }

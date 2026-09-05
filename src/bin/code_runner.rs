@@ -113,7 +113,7 @@ struct ExecuteRequest {
     cache_namespace: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ExecuteResponse {
     stdout: String,
     stderr: String,
